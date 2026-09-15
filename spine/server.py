@@ -14,6 +14,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,23 +49,41 @@ def _require_human_token(name, args):
             "%s 需要有效的 human_token；调用方自报的 approved_by/rejected_by 不可作为身份凭据" % name)
 
 
-_conn = None
 _close_vol = None
+# 每线程一个 sqlite 连接；h5 懒加载用锁保护（避免并发重复加载 400MB）
+_local = threading.local()
+_data_lock = threading.Lock()
 
 
 def conn():
-    global _conn
-    if _conn is None:
+    """**每线程一个** sqlite 连接。
+
+    2026-09-15 修一个让服务无法多客户端使用的 bug：此前是模块级单例连接，
+    而 `ThreadingHTTPServer` 每个请求开一个线程 → 第二个并发请求必然炸：
+
+        ProgrammingError: SQLite objects created in a thread can only be used
+        in that same thread.
+
+    后果：workbench 只能"单线程碰运气"地用，"注册进 hub 供多个 agent 调用"
+    根本不可能（同一连接被不同线程复用必抛）。db.connect 已开 WAL，
+    多连接并发读写是安全的。
+    """
+    c = getattr(_local, "conn", None)
+    if c is None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        _conn = db.connect(DB_PATH)
-    return _conn
+        c = db.connect(DB_PATH)
+        _local.conn = c
+    return c
 
 
 def _data():
     global _close_vol
     if _close_vol is None:
-        from spine import dataset  # noqa: PLC0415
-        _close_vol = dataset.load_h5(H5_PATH, start=os.environ.get("WB_START", "2024-01-01"))
+        with _data_lock:
+            if _close_vol is None:
+                from spine import dataset  # noqa: PLC0415
+                _close_vol = dataset.load_h5(
+                    H5_PATH, start=os.environ.get("WB_START", "2024-01-01"))
     return _close_vol
 
 

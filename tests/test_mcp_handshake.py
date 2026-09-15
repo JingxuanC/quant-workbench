@@ -82,3 +82,60 @@ def test_ping_and_tools_list(server):
 def test_unknown_method_still_errors(server):
     _, body = _post(server, {"jsonrpc": "2.0", "id": 4, "method": "bogus", "params": {}})
     assert json.loads(body)["error"]["code"] == -32601
+
+
+# ── 并发：每线程一个 sqlite 连接 ─────────────────────────────────────
+# 2026-09-15 修：模块级单例连接 + ThreadingHTTPServer = 第二个并发请求必然抛
+#   ProgrammingError: SQLite objects created in a thread can only be used in
+#   that same thread
+# 这让"注册进 hub 供多个 agent 调用"根本不可行。
+
+@pytest.fixture()
+def server_with_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "DB_PATH", str(tmp_path / "wb.db"))
+    monkeypatch.setattr(srv, "_local", threading.local())   # 隔离上一条测试的连接
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.H)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield httpd.server_address[1]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _call(port, tool, args):
+    _, body = _post(port, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": tool, "arguments": args}})
+    res = json.loads(body)["result"]
+    return res, "".join(c.get("text", "") for c in res.get("content") or [])
+
+
+def test_concurrent_requests_do_not_share_a_connection(server_with_db):
+    """★ 8 个并发写请求必须全部成功（回归：单例连接时从第 2 个起就炸）。"""
+    import concurrent.futures as cf
+
+    def one(i):
+        res, txt = _call(server_with_db, "wb_hypothesis",
+                         {"text": "并发 %d" % i, "mechanism": "m",
+                          "run_id": "r%d" % i, "inputs_hash": "ih%d" % i})
+        return res.get("isError"), txt
+
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        out = list(ex.map(one, range(8)))
+    bad = [(e, t[:120]) for e, t in out if e or "hypothesis_id" not in t]
+    assert not bad, "并发写入失败: %s" % bad
+
+
+def test_concurrent_reads(server_with_db):
+    import concurrent.futures as cf
+    _call(server_with_db, "wb_hypothesis",
+          {"text": "x", "mechanism": "m", "run_id": "r", "inputs_hash": "ih"})
+
+    def one(_):
+        res, txt = _call(server_with_db, "wb_report", {})
+        return res.get("isError"), txt
+
+    with cf.ThreadPoolExecutor(max_workers=6) as ex:
+        out = list(ex.map(one, range(6)))
+    assert all(not e for e, _ in out), out
