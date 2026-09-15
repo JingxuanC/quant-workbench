@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from spine import db, gate  # noqa: E402
+from spine import db, gate, ui  # noqa: E402
 
 DB_PATH = os.environ.get("WB_DB", "/data/workbench.db")
 H5_PATH = os.environ.get("WB_H5", "/data/daily_pv_all.h5")
@@ -94,6 +94,15 @@ def call_tool(name, args):
             q += " WHERE status=?"
             p.append(args["status"])
         return {"registry": [dict(r) for r in c.execute(q, p).fetchall()]}
+    if name == "wb_ui_report":
+        c2 = conn()
+        agg = lambda q: [dict(r) for r in c2.execute(q).fetchall()]
+        return {"overview": agg(ui.API_OVERVIEW), "pending": agg(ui.API_PENDING),
+                "registry": agg(ui.API_REGISTRY), "tombstone": agg(ui.API_TOMBSTONE),
+                "recent": agg("SELECT e.id,e.factor_id,f.name,e.net_ic,e.t_excess,"
+                              "e.turnover_annual,e.net_excess_annual,e.decision,e.reasons_json "
+                              "FROM eval_run e JOIN factor f ON f.id=e.factor_id "
+                              "ORDER BY e.id DESC LIMIT 15")}
     if name == "wb_report":
         return {"counts": db.counts(c),
                 "recent_evals": [dict(r) for r in c.execute(
@@ -113,6 +122,18 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(obj, ensure_ascii=False, default=str).encode())
 
     def do_GET(self):
+        if self.path.startswith("/ui") or self.path in ("/", "/wb", "/wb/"):
+            body = ui.HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return self.wfile.write(body)
+        if self.path.startswith("/api/report"):     # 看板数据（只读）
+            try:
+                return self._json(200, call_tool("wb_ui_report", {}))
+            except Exception as e:  # noqa: BLE001
+                return self._json(200, {"error": "%s: %s" % (type(e).__name__, e)})
         if self.path.startswith("/health"):
             return self._json(200, {"ok": True, "db": DB_PATH, "h5": H5_PATH})
         if self.path.startswith("/tools"):
