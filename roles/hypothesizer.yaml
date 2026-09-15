@@ -1,0 +1,18 @@
+role: hypothesizer
+prompt_ref: prompts/hypothesizer.md
+# 只能调这些 MCP 工具（其余一律无权）
+mcp_tools:
+  - get_a_news                 # 新闻
+  - get_a_reports              # 研报
+  - get_a_industry_reports
+  - get_a_announcements        # 公告
+  - get_a_lockup_expiry        # 解禁（被迫卖出）
+  - get_a_holder_num
+  - get_a_daily_dragon_tiger
+  - event_study                # 因果 mcp：量 CAR
+  - dml_cate                   # 哪类票对事件反应更强
+  - search_causal              # 记忆：别重复提死掉的假设
+inputs: []
+outputs: [hypothesis]
+budget: {max_llm_calls: 20, max_minutes: 15}
+forbidden: [wb_admit, wb_retire]      # 红线：角色永远不能自己批准/退役

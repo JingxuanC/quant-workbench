@@ -1,0 +1,4 @@
+pandas>=2.0
+numpy>=1.26,<2
+scipy>=1.10
+tables>=3.8          # 读 daily_pv_all.h5（服务器侧）
