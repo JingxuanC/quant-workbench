@@ -23,6 +23,7 @@ from spine import db, gate, ui  # noqa: E402
 
 DB_PATH = os.environ.get("WB_DB", "/data/workbench.db")
 H5_PATH = os.environ.get("WB_H5", "/data/daily_pv_all.h5")
+SERVER_VERSION = "1.0.0"
 
 # ── 人类专属工具的身份校验 ─────────────────────────────────────────────
 # SPINE §4「只有人类主体可 approve」。2026-09-15 修一个**可利用的漏洞**：
@@ -179,6 +180,34 @@ class H(BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(n) or b"{}")
         m = req.get("method")
         mid = req.get("id", 1)
+
+        # ── JSON-RPC 通知（无 id）不产生响应 ──────────────────────────
+        # 必须放在最前面：客户端（含 mcphub）在 initialize 之后会发
+        # `notifications/initialized`，若按普通请求回一个 result，严格的
+        # MCP 客户端会报错。
+        if m and m.startswith("notifications/"):
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        # ── MCP 握手 ─────────────────────────────────────────────────
+        # 没有这一段，mcphub 作为 MCP 客户端会连不上：
+        #   Failed to connect client for server workbench
+        #   "MCP error -32601: Unknown method: initialize"
+        # 于是该 server 的工具永远不会出现在任何分组里（tools/list 返回 []）。
+        # 注意：本服务**无状态**，所以 tools/list 不依赖 initialize 成功 ——
+        # 直接 curl tools/list 是通的，很容易误判成"握手没问题"（2026-09-15 实测）。
+        if m == "initialize":
+            p = req.get("params") or {}
+            return self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": p.get("protocolVersion") or "2024-11-05",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "workbench-mcp", "version": SERVER_VERSION},
+            }})
+        if m == "ping":
+            return self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {}})
+
         if m == "tools/list":
             return self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {"tools": [
                 {"name": k, "description": v[0], "inputSchema": {"type": "object",
