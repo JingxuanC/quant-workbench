@@ -1,0 +1,155 @@
+"""workbench-mcp：wb_* 的唯一入口（SPINE §1）。
+
+零第三方依赖（stdlib + spine）。形状与 hub 现有 MCP 服务一致：
+  GET  /health  /tools
+  POST /mcp  {"method":"tools/list"} / {"method":"tools/call","params":{"name":..,"arguments":..}}
+
+铁律（写在服务里，不靠调用方自觉）：
+  · 写工具缺 run_id/inputs_hash → 拒绝（spine.db 强制）
+  · wb_admit 只认人类主体（spine.db HUMAN_PRINCIPALS）
+  · batch_n 由账本统计，调用方传了也不采信
+"""
+
+import json
+import os
+import sys
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from spine import db, gate  # noqa: E402
+
+DB_PATH = os.environ.get("WB_DB", "/data/workbench.db")
+H5_PATH = os.environ.get("WB_H5", "/data/daily_pv_all.h5")
+_conn = None
+_close_vol = None
+
+
+def conn():
+    global _conn
+    if _conn is None:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        _conn = db.connect(DB_PATH)
+    return _conn
+
+
+def _data():
+    global _close_vol
+    if _close_vol is None:
+        from spine import dataset  # noqa: PLC0415
+        _close_vol = dataset.load_h5(H5_PATH, start=os.environ.get("WB_START", "2024-01-01"))
+    return _close_vol
+
+
+TOOLS = {
+    "wb_hypothesis": ("登记假设（agent 产出）", ["text", "mechanism"], ["source", "expected_ic",
+                     "expected_turnover", "proposed_by", "run_id", "inputs_hash"]),
+    "wb_factor": ("登记因子表达式", ["hypothesis_id", "name", "code"], ["run_id", "inputs_hash"]),
+    "wb_gate_evaluate": ("闸门评估（唯一准入权·无 LLM）", ["factor_id", "spec"],
+                         ["signal_name", "run_id", "inputs_hash"]),
+    "wb_admit": ("批准准入（仅人类主体）", ["factor_id", "eval_run_id", "approved_by"], ["note"]),
+    "wb_retire": ("退役因子", ["factor_id", "reason"], ["retired_by"]),
+    "wb_registry": ("因子动物园", [], ["status"]),
+    "wb_report": ("账本概览", [], ["kind"]),
+}
+
+
+def call_tool(name, args):
+    c = conn()
+    if name == "wb_hypothesis":
+        hid = db.add_hypothesis(c, args["text"], args["mechanism"],
+                                source=args.get("source", ""), expected_ic=args.get("expected_ic"),
+                                expected_turnover=args.get("expected_turnover"),
+                                proposed_by=args.get("proposed_by", "agent"),
+                                run_id=args.get("run_id"), ih=args.get("inputs_hash"))
+        return {"hypothesis_id": hid, "status": "proposed", "batch_n": db.counts(c)["batch_n"]}
+    if name == "wb_factor":
+        fid, eh = db.add_factor(c, args["hypothesis_id"], args["name"], args["code"],
+                                run_id=args.get("run_id"), ih=args.get("inputs_hash"))
+        return {"factor_id": fid, "expr_hash": eh, "status": "implemented"}
+    if name == "wb_gate_evaluate":
+        sig = gate.SIGNALS.get(args.get("signal_name"))
+        if sig is None:
+            return {"error": "unknown signal_name=%r（当前内置: %s）"
+                             % (args.get("signal_name"), list(gate.SIGNALS))}
+        close, vol = _data()
+        bn = db.counts(c)["batch_n"]          # 账本统计，不许自报
+        v = gate.evaluate(sig, args["spec"], close, vol, batch_n=bn, run_id=args.get("run_id"))
+        eid = db.add_eval(c, args["factor_id"], args["spec"], v,
+                          run_id=args.get("run_id"), ih=args.get("inputs_hash"))
+        v["eval_run_id"] = eid
+        return v
+    if name == "wb_admit":
+        aid = db.admit(c, args["factor_id"], args["eval_run_id"], args["approved_by"],
+                       note=args.get("note", ""))
+        return {"admission_id": aid, "status": "admitted"}
+    if name == "wb_retire":
+        db.retire(c, args["factor_id"], args["reason"], args.get("retired_by", "agent"))
+        return {"status": "retired"}
+    if name == "wb_registry":
+        q = "SELECT * FROM registry"
+        p = []
+        if args.get("status"):
+            q += " WHERE status=?"
+            p.append(args["status"])
+        return {"registry": [dict(r) for r in c.execute(q, p).fetchall()]}
+    if name == "wb_report":
+        return {"counts": db.counts(c),
+                "recent_evals": [dict(r) for r in c.execute(
+                    "SELECT id,factor_id,decision,t_excess,net_excess_annual,turnover_annual,"
+                    "k_windows,reasons_json FROM eval_run ORDER BY id DESC LIMIT 10").fetchall()]}
+    return {"error": "unknown tool %s" % name}
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj, ensure_ascii=False, default=str).encode())
+
+    def do_GET(self):
+        if self.path.startswith("/health"):
+            return self._json(200, {"ok": True, "db": DB_PATH, "h5": H5_PATH})
+        if self.path.startswith("/tools"):
+            return self._json(200, [{"name": k, "description": v[0], "required": v[1]}
+                                    for k, v in TOOLS.items()])
+        return self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        req = json.loads(self.rfile.read(n) or b"{}")
+        m = req.get("method")
+        mid = req.get("id", 1)
+        if m == "tools/list":
+            return self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+                {"name": k, "description": v[0], "inputSchema": {"type": "object",
+                 "properties": {a: {"type": "string"} for a in v[1] + v[2]},
+                 "required": v[1]}} for k, v in TOOLS.items()]}})
+        if m == "tools/call":
+            p = req.get("params") or {}
+            try:
+                out = call_tool(p.get("name"), p.get("arguments") or {})
+                is_err = isinstance(out, dict) and "error" in out
+            except Exception as e:  # noqa: BLE001
+                out = {"error": "%s: %s" % (type(e).__name__, e),
+                       "trace": traceback.format_exc()[-400:]}
+                is_err = True
+            return self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {
+                "content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False, default=str)}],
+                "isError": is_err}})
+        return self._json(200, {"jsonrpc": "2.0", "id": mid,
+                                "error": {"code": -32601, "message": "Unknown method: %s" % m}})
+
+
+def serve(host="0.0.0.0", port=50062):
+    ThreadingHTTPServer((host, port), H).serve_forever()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "50062"))
+    serve(os.environ.get("HOST", "0.0.0.0"), port)
