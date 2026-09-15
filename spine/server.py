@@ -49,6 +49,8 @@ TOOLS = {
     "wb_gate_evaluate": ("闸门评估（唯一准入权·无 LLM）", ["factor_id", "spec"],
                          ["signal_name", "run_id", "inputs_hash"]),
     "wb_admit": ("批准准入（仅人类主体）", ["factor_id", "eval_run_id", "approved_by"], ["note"]),
+    "wb_reject": ("否决待批因子（连原因入台账）", ["factor_id", "eval_run_id", "rejected_by"],
+                  ["reason"]),
     "wb_retire": ("退役因子", ["factor_id", "reason"], ["retired_by"]),
     "wb_registry": ("因子动物园", [], ["status"]),
     "wb_report": ("账本概览", [], ["kind"]),
@@ -84,6 +86,10 @@ def call_tool(name, args):
         aid = db.admit(c, args["factor_id"], args["eval_run_id"], args["approved_by"],
                        note=args.get("note", ""))
         return {"admission_id": aid, "status": "admitted"}
+    if name == "wb_reject":
+        db.reject(c, args["factor_id"], args["eval_run_id"], args["rejected_by"],
+                  reason=args.get("reason", ""))
+        return {"status": "rejected", "factor_id": args["factor_id"]}
     if name == "wb_retire":
         db.retire(c, args["factor_id"], args["reason"], args.get("retired_by", "agent"))
         return {"status": "retired"}

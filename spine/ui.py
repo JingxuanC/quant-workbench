@@ -20,7 +20,7 @@ SELECT f.id factor_id, f.name, h.text, h.mechanism, e.id eval_run_id,
 FROM factor f JOIN eval_run e ON e.factor_id = f.id
 LEFT JOIN hypothesis h ON h.id = f.hypothesis_id
 WHERE e.decision = 'admit'
-  AND f.id NOT IN (SELECT factor_id FROM admission)
+  AND e.id NOT IN (SELECT eval_run_id FROM admission)
 GROUP BY f.id HAVING e.id = MAX(e.id)
 ORDER BY e.t_excess DESC
 """

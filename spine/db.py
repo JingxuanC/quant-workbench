@@ -129,6 +129,17 @@ def admit(conn, factor_id, eval_run_id, approved_by, note="", supersedes=None):
     return cur.lastrowid
 
 
+def reject(conn, factor_id, eval_run_id, rejected_by, reason=""):
+    """否决一条待批因子：写一条 decision='rejected' 的 admission（只追加）。
+    这样待批队列（按 eval_run 判重）会清掉它，但**台账保留**谁在何时因何否决。"""
+    if not rejected_by:
+        raise ValueError("否决必须记录 rejected_by")
+    conn.execute("INSERT INTO admission(factor_id,eval_run_id,decision,approved_by,"
+                 "approved_at,note) VALUES(?,?,'rejected',?,?,?)",
+                 (factor_id, eval_run_id, rejected_by, time.time(), reason))
+    conn.commit()
+
+
 def retire(conn, factor_id, reason, retired_by="agent"):
     conn.execute("UPDATE registry SET status='retired',retired_reason=?,updated_at=? "
                  "WHERE factor_id=?", (reason, time.time(), factor_id))
