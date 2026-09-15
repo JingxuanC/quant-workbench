@@ -6,12 +6,13 @@
 
 铁律（写在服务里，不靠调用方自觉）：
   · 写工具缺 run_id/inputs_hash → 拒绝（spine.db 强制）
-  · wb_admit 只认人类主体（spine.db HUMAN_PRINCIPALS）
+  · wb_admit 只认人类主体（spine.db HUMAN_PRINCIPALS）**且**需 human_token
   · batch_n 由账本统计，调用方传了也不采信
 """
 
 import json
 import os
+import secrets
 import sys
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,30 @@ from spine import db, gate, ui  # noqa: E402
 
 DB_PATH = os.environ.get("WB_DB", "/data/workbench.db")
 H5_PATH = os.environ.get("WB_H5", "/data/daily_pv_all.h5")
+
+# ── 人类专属工具的身份校验 ─────────────────────────────────────────────
+# SPINE §4「只有人类主体可 approve」。2026-09-15 修一个**可利用的漏洞**：
+# 此前 db.admit 只校验 `approved_by` —— 那是**调用方自己传的字符串**。
+# 实测（公网 /wb/mcp，服务此前无任何鉴权）：
+#     approved_by='intruder' → 被拒
+#     approved_by='hjx'      → **通过主体校验**，只因 eval_run 不存在才没落库
+# 即凑出真实的 (factor_id, eval_run_id) 就能从公网批准因子。
+# 现在人类专属工具必须同时提供 WB_HUMAN_TOKEN（只有人类控制台持有）；
+# 未配置该环境变量时**一律拒绝**（fail-closed），不退化成无鉴权。
+HUMAN_TOOLS = {"wb_admit", "wb_reject", "wb_retire"}
+HUMAN_TOKEN = os.environ.get("WB_HUMAN_TOKEN", "")
+
+
+def _require_human_token(name, args):
+    if not HUMAN_TOKEN:
+        raise PermissionError(
+            "%s 已禁用：服务端未配置 WB_HUMAN_TOKEN（fail-closed，不接受无鉴权的人类操作）" % name)
+    got = str((args or {}).get("human_token") or "")
+    if not got or not secrets.compare_digest(got, HUMAN_TOKEN):
+        raise PermissionError(
+            "%s 需要有效的 human_token；调用方自报的 approved_by/rejected_by 不可作为身份凭据" % name)
+
+
 _conn = None
 _close_vol = None
 
@@ -58,6 +83,8 @@ TOOLS = {
 
 
 def call_tool(name, args):
+    if name in HUMAN_TOOLS:
+        _require_human_token(name, args)
     c = conn()
     if name == "wb_hypothesis":
         hid = db.add_hypothesis(c, args["text"], args["mechanism"],
